@@ -31,7 +31,7 @@ Dynamo 是一个**轻量级、零依赖**的 Java 8+ 动态线程池库。它允
 <dependency>
     <groupId>cn.codingguide</groupId>
     <artifactId>dynamo</artifactId>
-    <version>1.0.0-SNAPSHOT</version>
+    <version>1.0.0</version>
 </dependency>
 ```
 
