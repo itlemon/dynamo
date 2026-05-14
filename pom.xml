@@ -7,7 +7,7 @@
 
     <groupId>cn.codingguide</groupId>
     <artifactId>dynamo</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
     <packaging>jar</packaging>
 
     <name>Dynamo</name>
@@ -32,9 +32,11 @@
 
     <scm>
         <connection>scm:git:git://github.com/itlemon/dynamo.git</connection>
-        <developerConnection>scm:git:ssh://github.com:itlemon/dynamo.git</developerConnection>
-        <url>https://github.com/itlemon/dynamo/tree/main</url>
+        <developerConnection>scm:git:ssh://git@github.com:itlemon/dynamo.git</developerConnection>
+        <url>https://github.com/itlemon/dynamo/tree/master</url>
     </scm>
+
+    <!-- Maven Central Portal 不需要 distributionManagement 配置 -->
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -109,6 +111,33 @@
                         </goals>
                     </execution>
                 </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-gpg-plugin</artifactId>
+                <version>3.1.0</version>
+                <executions>
+                    <execution>
+                        <id>sign-artifacts</id>
+                        <phase>verify</phase>
+                        <goals>
+                            <goal>sign</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.sonatype.central</groupId>
+                <artifactId>central-publishing-maven-plugin</artifactId>
+                <version>0.10.0</version>
+                <extensions>true</extensions>
+                <configuration>
+                    <publishingServerId>central</publishingServerId>
+                    <autoPublish>true</autoPublish>
+                    <waitUntil>published</waitUntil>
+                </configuration>
             </plugin>
         </plugins>
     </build>

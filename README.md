@@ -31,7 +31,7 @@ Unlike traditional `ThreadPoolExecutor`, Dynamo uses `Supplier<Integer>` to deco
 <dependency>
     <groupId>cn.codingguide</groupId>
     <artifactId>dynamo</artifactId>
-    <version>1.0.0</version>
+    <version>1.0.1</version>
 </dependency>
 ```
 

@@ -100,7 +100,7 @@ public class ResizableCapacityLinkedBlockingQueue<E> extends AbstractQueue<E>
             throw new IllegalArgumentException();
         }
         this.capacity = capacity;
-        this.last = head = new Node<E>(null);
+        this.last = head = new Node<>(null);
     }
 
     /**

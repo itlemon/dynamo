@@ -140,7 +140,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         private RejectedExecutionHandler rejectedHandler;
         private Duration refreshInterval = Duration.ofSeconds(5);
         private ThreadFactory threadFactory;
-        private List<ParameterChangeListener> changeListeners = new ArrayList<ParameterChangeListener>();
+        private final List<ParameterChangeListener> changeListeners = new ArrayList<>();
 
         /**
          * Set the thread pool name.
@@ -182,12 +182,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
          * @return this builder
          */
         public Builder keepAliveSeconds(final long v) {
-            this.keepAliveSecSupplier = new Supplier<Long>() {
-                @Override
-                public Long get() {
-                    return v;
-                }
-            };
+            this.keepAliveSecSupplier = () -> v;
             return this;
         }
 
@@ -209,12 +204,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
          * @return this builder
          */
         public Builder queueCapacity(final int v) {
-            this.queueCapacitySupplier = new Supplier<Integer>() {
-                @Override
-                public Integer get() {
-                    return v;
-                }
-            };
+            this.queueCapacitySupplier = () -> v;
             return this;
         }
 
@@ -308,20 +298,10 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                 throw new IllegalArgumentException("refreshInterval must be > 0");
             }
             if (keepAliveSecSupplier == null) {
-                keepAliveSecSupplier = new Supplier<Long>() {
-                    @Override
-                    public Long get() {
-                        return 60L;
-                    }
-                };
+                keepAliveSecSupplier = () -> 60L;
             }
             if (customWorkQueue == null && queueCapacitySupplier == null) {
-                queueCapacitySupplier = new Supplier<Integer>() {
-                    @Override
-                    public Integer get() {
-                        return 1024;
-                    }
-                };
+                queueCapacitySupplier = () -> 1024;
             }
 
             String prefix = normalizePrefix(name);
@@ -333,7 +313,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                 threadFactory = defaultThreadFactory(prefix);
             }
 
-            List<ParameterChangeListener> listeners = new CopyOnWriteArrayList<ParameterChangeListener>(
+            List<ParameterChangeListener> listeners = new CopyOnWriteArrayList<>(
                     changeListeners);
 
             return new DynamicThreadPoolExecutor(this, prefix, logger, listeners);
@@ -376,12 +356,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
 
         long ms = b.refreshInterval.toMillis();
         this.refreshFuture = REFRESHER.scheduleWithFixedDelay(
-                new Runnable() {
-                    @Override
-                    public void run() {
-                        refresh();
-                    }
-                },
+                this::refresh,
                 ms, ms, TimeUnit.MILLISECONDS);
     }
 
@@ -389,7 +364,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         if (b.customWorkQueue != null) {
             return b.customWorkQueue;
         }
-        return new ResizableCapacityLinkedBlockingQueue<Runnable>(b.queueCapacitySupplier.get());
+        return new ResizableCapacityLinkedBlockingQueue<>(b.queueCapacitySupplier.get());
     }
 
     private void refresh() {
@@ -399,8 +374,8 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             if (newCoreObj == null || newMaxObj == null) {
                 return;
             }
-            int newCore = newCoreObj.intValue();
-            int newMax = newMaxObj.intValue();
+            int newCore = newCoreObj;
+            int newMax = newMaxObj;
             if (newCore <= 0 || newMax < newCore) {
                 return;
             }
@@ -438,7 +413,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
 
             Long newKeepObj = keepAliveSecSupplier.get();
             if (newKeepObj != null) {
-                long newKeep = newKeepObj.longValue();
+                long newKeep = newKeepObj;
                 if (newKeep >= 0 && newKeep != lastKeepAliveSec) {
                     long oldKeep = lastKeepAliveSec;
                     setKeepAliveTime(newKeep, TimeUnit.SECONDS);
@@ -450,7 +425,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
             if (resizableQueue != null) {
                 Integer newQueueObj = queueCapacitySupplier.get();
                 if (newQueueObj != null) {
-                    int newQueue = newQueueObj.intValue();
+                    int newQueue = newQueueObj;
                     if (newQueue > 0 && newQueue != lastQueueCapacity) {
                         int oldQueue = lastQueueCapacity;
                         resizableQueue.setCapacity(newQueue);
@@ -480,12 +455,9 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     }
 
     private RejectedExecutionHandler wrap(final RejectedExecutionHandler delegate) {
-        return new RejectedExecutionHandler() {
-            @Override
-            public void rejectedExecution(Runnable r, ThreadPoolExecutor e) {
-                rejectedCount.increment();
-                delegate.rejectedExecution(r, e);
-            }
+        return (r, e) -> {
+            rejectedCount.increment();
+            delegate.rejectedExecution(r, e);
         };
     }
 
@@ -583,12 +555,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
 
     private static ThreadFactory defaultThreadFactory(final String prefix) {
         final AtomicInteger seq = new AtomicInteger();
-        return new ThreadFactory() {
-            @Override
-            public Thread newThread(Runnable r) {
-                return new Thread(r, prefix + "-" + seq.getAndIncrement());
-            }
-        };
+        return r -> new Thread(r, prefix + "-" + seq.getAndIncrement());
     }
 
     // ==================== Default Rejection Policies ====================
