@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![JDK](https://img.shields.io/badge/JDK-8+-green.svg)](https://www.oracle.com/java/technologies/javase-downloads.html)
-[![Maven Central](https://img.shields.io/badge/maven--central-1.0.0--SNAPSHOT-orange.svg)](https://github.com/itlemon/dynamo)
+[![Maven Central](https://img.shields.io/badge/maven--central-1.0.0-orange.svg)](https://github.com/itlemon/dynamo)
 
 ## Dynamo 是什么?
 
