@@ -29,15 +29,12 @@ public class QuickTest {
         System.out.println("\nTest 2: Submit 10 tasks");
         for (int i = 0; i < 10; i++) {
             final int taskId = i;
-            pool.execute(new Runnable() {
-                @Override
-                public void run() {
-                    System.out.println("Task " + taskId + " running on " + Thread.currentThread().getName());
-                    try {
-                        Thread.sleep(100);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
+            pool.execute(() -> {
+                System.out.println("Task " + taskId + " running on " + Thread.currentThread().getName());
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             });
         }
@@ -67,18 +64,8 @@ public class QuickTest {
         DynamicThreadPoolExecutor pool2 = DynamicThreadPoolExecutor.builder()
                 .threadPoolName("test-pool")
                 .corePoolSize(core2::get)
-                .maximumPoolSize(new java.util.function.Supplier<Integer>() {
-                    @Override
-                    public Integer get() {
-                        return core2.get() * 2;
-                    }
-                })
-                .addChangeListener(new ParameterChangeListener() {
-                    @Override
-                    public void onChange(ParameterChangeEvent event) {
-                        System.out.println(">>> Parameter changed: " + event);
-                    }
-                })
+                .maximumPoolSize(() -> core2.get() * 2)
+                .addChangeListener(event -> System.out.println(">>> Parameter changed: " + event))
                 .build();
 
         System.out.println("pool2 name: " + pool2.getPoolName());
