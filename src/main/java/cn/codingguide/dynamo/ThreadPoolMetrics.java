@@ -45,6 +45,11 @@ public final class ThreadPoolMetrics {
     private final int queueRemainingCapacity;
     private final long rejectedCount;
 
+    // Historical peaks (since pool creation)
+    private final int largestPoolSize;
+    private final int largestQueueSize;
+    private final long maxTaskTimeMillis;
+
     // Runtime parameter snapshot
     private final int corePoolSize;
     private final int maximumPoolSize;
@@ -54,6 +59,7 @@ public final class ThreadPoolMetrics {
     public ThreadPoolMetrics(String poolName, long timestamp,
                              int activeCount, long taskCount, long completedTaskCount,
                              int queueSize, int queueRemainingCapacity, long rejectedCount,
+                             int largestPoolSize, int largestQueueSize, long maxTaskTimeMillis,
                              int corePoolSize, int maximumPoolSize,
                              long keepAliveSeconds, int queueCapacity) {
         this.poolName = poolName;
@@ -64,6 +70,9 @@ public final class ThreadPoolMetrics {
         this.queueSize = queueSize;
         this.queueRemainingCapacity = queueRemainingCapacity;
         this.rejectedCount = rejectedCount;
+        this.largestPoolSize = largestPoolSize;
+        this.largestQueueSize = largestQueueSize;
+        this.maxTaskTimeMillis = maxTaskTimeMillis;
         this.corePoolSize = corePoolSize;
         this.maximumPoolSize = maximumPoolSize;
         this.keepAliveSeconds = keepAliveSeconds;
@@ -94,6 +103,30 @@ public final class ThreadPoolMetrics {
             return 0.0;
         }
         return (double) activeCount / maximumPoolSize;
+    }
+
+    /**
+     * Derive a coarse {@link LoadLevel} from current utilization, intended to guide alerting.
+     * <p>
+     * The level is the more severe of the pool and queue utilization:
+     * <ul>
+     *   <li>{@link LoadLevel#CRITICAL}: either utilization &gt;= 0.9</li>
+     *   <li>{@link LoadLevel#WARN}: either utilization &gt;= 0.75</li>
+     *   <li>{@link LoadLevel#NORMAL}: otherwise</li>
+     * </ul>
+     * Dynamo only reports this level; whether to log, alert, or scale is left to the caller.
+     *
+     * @return the current load level
+     */
+    public LoadLevel loadLevel() {
+        double load = Math.max(poolUtilization(), queueUtilization());
+        if (load >= 0.9) {
+            return LoadLevel.CRITICAL;
+        }
+        if (load >= 0.75) {
+            return LoadLevel.WARN;
+        }
+        return LoadLevel.NORMAL;
     }
 
     public String getPoolName() {
@@ -128,6 +161,34 @@ public final class ThreadPoolMetrics {
         return rejectedCount;
     }
 
+    /**
+     * The largest number of threads that have ever simultaneously been in the pool.
+     *
+     * @return historical peak pool size
+     */
+    public int getLargestPoolSize() {
+        return largestPoolSize;
+    }
+
+    /**
+     * The largest queue size ever observed (sampled when tasks are submitted).
+     *
+     * @return historical peak queue size
+     */
+    public int getLargestQueueSize() {
+        return largestQueueSize;
+    }
+
+    /**
+     * The longest single-task execution time observed, in milliseconds. Returns {@code 0} if no
+     * task has completed yet.
+     *
+     * @return maximum task run time in milliseconds
+     */
+    public long getMaxTaskTimeMillis() {
+        return maxTaskTimeMillis;
+    }
+
     public int getCorePoolSize() {
         return corePoolSize;
     }
@@ -147,8 +208,10 @@ public final class ThreadPoolMetrics {
     @Override
     public String toString() {
         return String.format(
-                "ThreadPoolMetrics{pool='%s', active=%d/%d, queue=%d/%d(%.2f%%), rejected=%d, completed=%d}",
+                "ThreadPoolMetrics{pool='%s', active=%d/%d, queue=%d/%d(%.2f%%), load=%s, "
+                        + "rejected=%d, completed=%d, peakPool=%d, peakQueue=%d, maxTaskTime=%dms}",
                 poolName, activeCount, maximumPoolSize, queueSize, queueCapacity,
-                queueUtilization() * 100, rejectedCount, completedTaskCount);
+                queueUtilization() * 100, loadLevel(), rejectedCount, completedTaskCount,
+                largestPoolSize, largestQueueSize, maxTaskTimeMillis);
     }
 }

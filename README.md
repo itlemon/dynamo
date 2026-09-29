@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![JDK](https://img.shields.io/badge/JDK-8+-green.svg)](https://www.oracle.com/java/technologies/javase-downloads.html)
-[![Maven Central](https://img.shields.io/badge/maven--central-1.0.2-orange.svg)](https://github.com/itlemon/dynamo)
+[![Maven Central](https://img.shields.io/badge/maven--central-1.1.0-orange.svg)](https://github.com/itlemon/dynamo)
 
 ## What is Dynamo?
 
@@ -21,6 +21,9 @@ Unlike traditional `ThreadPoolExecutor`, Dynamo uses `Supplier<Integer>` to deco
 - **Supplier-based**: Works with any config source (Nacos, Apollo, Consul, ZooKeeper, etc.)
 - **Static final friendly**: Thread pool can be declared as `static final`
 - **Metrics & events**: Built-in metrics exposure and parameter change listeners
+- **Task-level timeout detection**: Warn on tasks that wait too long in the queue or run too long
+- **Historical peaks**: Track peak pool size, peak queue size, and slowest task
+- **Load level & registry**: Derived load level for alerting and a read-only registry of all live pools
 - **Production-ready**: No reflection (on queue resize), no JVM flags required
 
 ## Quick Start
@@ -31,7 +34,7 @@ Unlike traditional `ThreadPoolExecutor`, Dynamo uses `Supplier<Integer>` to deco
 <dependency>
     <groupId>cn.codingguide</groupId>
     <artifactId>dynamo</artifactId>
-    <version>1.0.2</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -55,7 +58,7 @@ public class OrderService {
 }
 ```
 
-That's it! When `NacosConfig` values change (via Nacos config center), Dynamo automatically applies the new values to the thread pool within 5 seconds (default refresh interval).
+That's it! When `NacosConfig` values change (via Nacos config center), Dynamo automatically applies the new values to the thread pool within 5 seconds (the default *polling* interval). Need it instantly? See [Near-Real-Time Refresh](#near-real-time-refresh-push-pull-hybrid).
 
 ## Common Usage Scenarios
 
@@ -177,6 +180,57 @@ private static final DynamicThreadPoolExecutor POOL =
         .build();
 ```
 
+### 9. Task-Level Timeout Detection
+
+```java
+private static final DynamicThreadPoolExecutor POOL =
+    DynamicThreadPoolExecutor.builder()
+        .corePoolSize(() -> config.getInt("core", 4))
+        .maximumPoolSize(() -> config.getInt("max", 32))
+        .runTimeout(2000)     // Warn if a task runs longer than 2000ms
+        .queueTimeout(500)    // Warn if a task waited in the queue longer than 500ms
+        // Optional: react to timeouts (send an alert, record a metric, etc.)
+        .addTaskTimeoutListener(event -> {
+            if (event.getType() == TaskTimeoutType.RUN_TIMEOUT) {
+                alertService.send("Slow task in " + event.getPoolName()
+                    + ": ran " + event.getElapsedMillis() + "ms");
+            }
+        })
+        .build();
+```
+
+When a threshold is exceeded, Dynamo logs a warning and notifies any registered
+`TaskTimeoutListener`. Both checks are off by default and add zero overhead until enabled.
+
+### 10. Built-in Change Auditing
+
+```java
+// Instead of writing your own logging listener, just call logChanges()
+private static final DynamicThreadPoolExecutor POOL =
+    DynamicThreadPoolExecutor.builder()
+        .corePoolSize(() -> config.getInt("core", 4))
+        .maximumPoolSize(() -> config.getInt("max", 32))
+        .logChanges()   // Logs every parameter change as a structured audit line
+        .build();
+
+// Log output example:
+// [DTP-CHANGE] pool=dynamic-OrderService type=CORE_POOL_SIZE 4 -> 8
+```
+
+### 11. Read-Only Registry (All Live Pools)
+
+```java
+// Every pool auto-registers itself (weak reference, never leaks memory).
+// Enumerate all live pools for a monitoring endpoint:
+for (DynamicThreadPoolExecutor pool : DynamoRegistry.pools()) {
+    ThreadPoolMetrics m = pool.getMetrics();
+    export(m);  // push to Prometheus / a dashboard / a log
+}
+
+// Or collect metrics from all pools in one call:
+List<ThreadPoolMetrics> all = DynamoRegistry.collectMetrics();
+```
+
 ## Integration with Config Centers
 
 Dynamo is **config-source agnostic**. It works with any config center as long as you can wrap it in a `Supplier`.
@@ -266,10 +320,40 @@ metrics.getRejectedCount();         // Total rejected tasks
 metrics.getCorePoolSize();          // Current core size
 metrics.getMaximumPoolSize();       // Current max size
 
+// Historical peaks (since pool creation)
+metrics.getLargestPoolSize();       // Peak number of threads
+metrics.getLargestQueueSize();      // Peak queue size
+metrics.getMaxTaskTimeMillis();     // Slowest task (requires runTimeout enabled)
+
 // Derived metrics
 metrics.queueUtilization();         // Queue usage: 0.0 ~ 1.0
 metrics.poolUtilization();          // Pool usage: 0.0 ~ 1.0
+metrics.loadLevel();                // NORMAL / WARN / CRITICAL (for alerting)
 ```
+
+### Task Timeout Events
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> config.core())
+    .maximumPoolSize(() -> config.max())
+    .runTimeout(2000)     // milliseconds; 0 (default) disables the check
+    .queueTimeout(500)    // milliseconds; 0 (default) disables the check
+    .addTaskTimeoutListener(event -> {
+        System.out.printf("%s in %s: task=%s elapsed=%dms threshold=%dms%n",
+            event.getType(),
+            event.getPoolName(),
+            event.getTaskName(),
+            event.getElapsedMillis(),
+            event.getThresholdMillis());
+    })
+    .build();
+```
+
+- `RUN_TIMEOUT` fires when a single task runs longer than `runTimeout`.
+- `QUEUE_TIMEOUT` fires when a task waited in the queue longer than `queueTimeout` before starting.
+- Detection is measured with the executor's own `beforeExecute` / `afterExecute` hooks, so there
+  is no extra thread or timer.
 
 ### Parameter Change Events
 
@@ -296,6 +380,46 @@ DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
     .maximumPoolSize(() -> config.max())
     .refreshInterval(Duration.ofSeconds(1))  // Check every 1 second
     .build();
+```
+
+### Near-Real-Time Refresh (Push-Pull Hybrid)
+
+The 5-second interval is only the *polling* period, not the change-to-effect latency. If your
+config center pushes changes, you can apply them instantly with `refreshNow()` and keep the poll
+as a safety net:
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> NacosConfig.getInt("pool.core", 4))
+    .maximumPoolSize(() -> NacosConfig.getInt("pool.max", 32))
+    .build();
+
+// Wire into your config center's change callback
+configService.addListener(dataId, group, content -> {
+    NacosConfig.update(content);   // update the cache your Supplier reads
+    pool.refreshNow();             // apply immediately, no 5s wait
+});
+```
+
+`refreshNow()` is thread-safe and runs on the calling thread; it reads the current `Supplier`
+values and applies any changes, exactly like the scheduled poll. Your `Supplier` must still be
+fast and non-blocking.
+
+### Slow-Refresh Guard
+
+Because all pools share one refresher thread, a slow (blocking) `Supplier` could stall every
+pool's refresh. Dynamo warns when a single refresh cycle exceeds a threshold (default 1000ms),
+so you can identify the offending pool:
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> config.core())
+    .maximumPoolSize(() -> config.max())
+    .slowRefreshThreshold(500)   // warn if a refresh takes > 500ms; 0 disables
+    .build();
+
+// Log output example:
+// [DTP-SLOW-REFRESH] pool=dynamic-OrderService cost=1200ms threshold=500ms - check your Supplier...
 ```
 
 ## Design Highlights

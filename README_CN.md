@@ -6,7 +6,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![JDK](https://img.shields.io/badge/JDK-8+-green.svg)](https://www.oracle.com/java/technologies/javase-downloads.html)
-[![Maven Central](https://img.shields.io/badge/maven--central-1.0.2-orange.svg)](https://github.com/itlemon/dynamo)
+[![Maven Central](https://img.shields.io/badge/maven--central-1.1.0-orange.svg)](https://github.com/itlemon/dynamo)
 
 ## Dynamo 是什么?
 
@@ -21,6 +21,9 @@ Dynamo 是一个**轻量级、零依赖**的 Java 8+ 动态线程池库。它允
 - **基于 Supplier**:适配任意配置中心(Nacos、Apollo、Consul、ZooKeeper 等)
 - **支持 static final**:线程池可以声明为 `static final`
 - **指标 & 事件**:内置指标暴露和参数变更监听器
+- **任务级超时检测**:任务排队过久或运行过久时告警
+- **历史峰值**:记录峰值线程数、峰值队列大小、最慢任务耗时
+- **载荷等级 & 注册表**:提供用于告警的载荷等级,以及可枚举所有存活线程池的只读注册表
 - **生产级别**:无反射(队列扩容),无需 JVM 启动参数
 
 ## 快速开始
@@ -31,7 +34,7 @@ Dynamo 是一个**轻量级、零依赖**的 Java 8+ 动态线程池库。它允
 <dependency>
     <groupId>cn.codingguide</groupId>
     <artifactId>dynamo</artifactId>
-    <version>1.0.2</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -55,7 +58,7 @@ public class OrderService {
 }
 ```
 
-就这么简单!当 `NacosConfig` 的值变化时(通过 Nacos 配置中心),Dynamo 会在 5 秒内(默认刷新间隔)自动应用新值到线程池。
+就这么简单!当 `NacosConfig` 的值变化时(通过 Nacos 配置中心),Dynamo 会在 5 秒内(默认**轮询**间隔)自动应用新值到线程池。想要即时生效?见[近实时刷新](#近实时刷新推拉结合)。
 
 ## 常用场景
 
@@ -177,6 +180,57 @@ private static final DynamicThreadPoolExecutor POOL =
         .build();
 ```
 
+### 9. 任务级超时检测
+
+```java
+private static final DynamicThreadPoolExecutor POOL =
+    DynamicThreadPoolExecutor.builder()
+        .corePoolSize(() -> config.getInt("core", 4))
+        .maximumPoolSize(() -> config.getInt("max", 32))
+        .runTimeout(2000)     // 任务运行超过 2000ms 时告警
+        .queueTimeout(500)    // 任务在队列中等待超过 500ms 时告警
+        // 可选:对超时做出响应(发告警、埋点等)
+        .addTaskTimeoutListener(event -> {
+            if (event.getType() == TaskTimeoutType.RUN_TIMEOUT) {
+                alertService.send("线程池 " + event.getPoolName()
+                    + " 出现慢任务:运行 " + event.getElapsedMillis() + "ms");
+            }
+        })
+        .build();
+```
+
+超过阈值时,Dynamo 会打印告警日志,并通知已注册的 `TaskTimeoutListener`。两项检测默认关闭,
+不开启时零开销。
+
+### 10. 内置变更审计
+
+```java
+// 无需自己写日志监听器,调用 logChanges() 即可
+private static final DynamicThreadPoolExecutor POOL =
+    DynamicThreadPoolExecutor.builder()
+        .corePoolSize(() -> config.getInt("core", 4))
+        .maximumPoolSize(() -> config.getInt("max", 32))
+        .logChanges()   // 将每次参数变更打成结构化审计日志
+        .build();
+
+// 日志输出示例:
+// [DTP-CHANGE] pool=dynamic-OrderService type=CORE_POOL_SIZE 4 -> 8
+```
+
+### 11. 只读注册表(所有存活线程池)
+
+```java
+// 每个线程池创建时自动登记(弱引用,不会造成内存泄漏)。
+// 遍历所有存活线程池,用于统一监控端点:
+for (DynamicThreadPoolExecutor pool : DynamoRegistry.pools()) {
+    ThreadPoolMetrics m = pool.getMetrics();
+    export(m);  // 上报到 Prometheus / 监控大盘 / 日志
+}
+
+// 或者一次性采集所有线程池的指标:
+List<ThreadPoolMetrics> all = DynamoRegistry.collectMetrics();
+```
+
 ## 配置中心集成
 
 Dynamo 与**配置源无关**。只要你能把它包装成 `Supplier`,任何配置中心都可以接入。
@@ -266,10 +320,39 @@ metrics.getRejectedCount();         // 累计拒绝数
 metrics.getCorePoolSize();          // 当前核心线程数
 metrics.getMaximumPoolSize();       // 当前最大线程数
 
+// 历史峰值(自线程池创建以来)
+metrics.getLargestPoolSize();       // 峰值线程数
+metrics.getLargestQueueSize();      // 峰值队列大小
+metrics.getMaxTaskTimeMillis();     // 最慢任务耗时(需开启 runTimeout)
+
 // 衍生指标
 metrics.queueUtilization();         // 队列使用率: 0.0 ~ 1.0
 metrics.poolUtilization();          // 线程池使用率: 0.0 ~ 1.0
+metrics.loadLevel();                // NORMAL / WARN / CRITICAL(用于告警)
 ```
+
+### 任务超时事件
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> config.core())
+    .maximumPoolSize(() -> config.max())
+    .runTimeout(2000)     // 毫秒;0(默认)表示关闭该检测
+    .queueTimeout(500)    // 毫秒;0(默认)表示关闭该检测
+    .addTaskTimeoutListener(event -> {
+        System.out.printf("%s 线程池 %s: task=%s 耗时=%dms 阈值=%dms%n",
+            event.getType(),
+            event.getPoolName(),
+            event.getTaskName(),
+            event.getElapsedMillis(),
+            event.getThresholdMillis());
+    })
+    .build();
+```
+
+- `RUN_TIMEOUT`:单个任务运行时间超过 `runTimeout` 时触发。
+- `QUEUE_TIMEOUT`:任务在队列中等待时间超过 `queueTimeout`(在开始执行前)时触发。
+- 检测复用线程池自身的 `beforeExecute` / `afterExecute` 钩子实现,**无额外线程、无定时器**。
 
 ### 参数变更事件
 
@@ -296,6 +379,43 @@ DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
     .maximumPoolSize(() -> config.max())
     .refreshInterval(Duration.ofSeconds(1))  // 每秒检查一次
     .build();
+```
+
+### 近实时刷新(推拉结合)
+
+5 秒只是**轮询周期**,不是"配置变更到生效"的延迟。如果你的配置中心支持推送,可以用
+`refreshNow()` 让变更即时生效,同时保留轮询作为兜底:
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> NacosConfig.getInt("pool.core", 4))
+    .maximumPoolSize(() -> NacosConfig.getInt("pool.max", 32))
+    .build();
+
+// 接入配置中心的变更回调
+configService.addListener(dataId, group, content -> {
+    NacosConfig.update(content);   // 更新 Supplier 读取的缓存
+    pool.refreshNow();             // 立刻生效,不用等 5 秒
+});
+```
+
+`refreshNow()` 是线程安全的,在调用线程上执行:它读取当前 `Supplier` 的值并应用变更,行为
+与定时轮询完全一致。你的 `Supplier` 仍需保证快速、非阻塞。
+
+### 慢刷新守卫
+
+由于所有线程池共享一个刷新线程,一个慢(阻塞)的 `Supplier` 可能拖垮所有池的刷新。Dynamo 会在
+单次刷新耗时超过阈值(默认 1000ms)时告警,帮你定位到是哪个池出了问题:
+
+```java
+DynamicThreadPoolExecutor pool = DynamicThreadPoolExecutor.builder()
+    .corePoolSize(() -> config.core())
+    .maximumPoolSize(() -> config.max())
+    .slowRefreshThreshold(500)   // 单次刷新超过 500ms 告警;传 0 关闭
+    .build();
+
+// 日志输出示例:
+// [DTP-SLOW-REFRESH] pool=dynamic-OrderService cost=1200ms threshold=500ms - check your Supplier...
 ```
 
 ## 设计亮点

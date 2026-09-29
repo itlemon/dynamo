@@ -32,6 +32,10 @@ bin/
 # Logs
 *.log
 
+# Stress test output artifacts
+stress-test-output.txt
+stress-test-result.txt
+
 # Build artifacts
 *.jar
 *.war

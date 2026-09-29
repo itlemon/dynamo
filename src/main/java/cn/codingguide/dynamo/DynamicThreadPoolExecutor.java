@@ -30,7 +30,9 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAccumulator;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 
 import cn.codingguide.dynamo.internal.logger.Logger;
@@ -92,6 +94,40 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     private final LongAdder rejectedCount = new LongAdder();
     private final Logger log;
     private final List<ParameterChangeListener> changeListeners;
+
+    /**
+     * Task-level timeout detection. A value of {@code 0} disables the corresponding check.
+     */
+    private final long runTimeoutMillis;
+    private final long queueTimeoutMillis;
+    private final List<TaskTimeoutListener> taskTimeoutListeners;
+
+    /**
+     * Serializes {@link #refresh()} so the scheduled poller and any {@link #refreshNow()} caller
+     * never apply changes concurrently.
+     */
+    private final ReentrantLock refreshLock = new ReentrantLock();
+
+    /**
+     * A refresh cycle slower than this (milliseconds) is logged as a warning, so a badly written
+     * (blocking) {@code Supplier} that stalls the shared refresher can be identified.
+     */
+    private final long slowRefreshThresholdMillis;
+
+    /**
+     * Records the run start time (nanos) of the task currently executing on this worker thread,
+     * set in {@link #beforeExecute} and read in {@link #afterExecute}. Only used when run-timeout
+     * detection is enabled.
+     */
+    private final ThreadLocal<Long> runStartNanos = new ThreadLocal<>();
+
+    /**
+     * Historical peaks, updated lock-free.
+     */
+    private final LongAccumulator largestQueueSize =
+            new LongAccumulator(Math::max, 0L);
+    private final LongAccumulator maxTaskTimeMillis =
+            new LongAccumulator(Math::max, 0L);
 
     private volatile int lastCore;
     private volatile int lastMax;
@@ -157,6 +193,11 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         private Duration refreshInterval = Duration.ofSeconds(5);
         private ThreadFactory threadFactory;
         private final List<ParameterChangeListener> changeListeners = new ArrayList<>();
+        private final List<TaskTimeoutListener> taskTimeoutListeners = new ArrayList<>();
+        private long runTimeoutMillis;
+        private long queueTimeoutMillis;
+        private boolean logChanges;
+        private long slowRefreshThresholdMillis = 1000L;
 
         /**
          * Set the thread pool name.
@@ -293,6 +334,82 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         }
 
         /**
+         * Enable built-in structured logging of every parameter change.
+         * <p>
+         * This is a convenience for registering a {@link LoggingChangeListener}. It gives you
+         * change auditing out of the box without writing a listener.
+         *
+         * @return this builder
+         */
+        public Builder logChanges() {
+            this.logChanges = true;
+            return this;
+        }
+
+        /**
+         * Enable run-timeout detection. When a single task runs longer than {@code millis},
+         * a warning is logged and any registered {@link TaskTimeoutListener} is notified.
+         * A value of {@code 0} (the default) disables the check.
+         *
+         * @param millis run-timeout threshold in milliseconds (must be &gt;= 0)
+         * @return this builder
+         */
+        public Builder runTimeout(long millis) {
+            if (millis < 0) {
+                throw new IllegalArgumentException("runTimeout must be >= 0");
+            }
+            this.runTimeoutMillis = millis;
+            return this;
+        }
+
+        /**
+         * Enable queue-timeout detection. When a task waited in the queue longer than
+         * {@code millis} before starting, a warning is logged and any registered
+         * {@link TaskTimeoutListener} is notified. A value of {@code 0} (the default) disables
+         * the check.
+         *
+         * @param millis queue-timeout threshold in milliseconds (must be &gt;= 0)
+         * @return this builder
+         */
+        public Builder queueTimeout(long millis) {
+            if (millis < 0) {
+                throw new IllegalArgumentException("queueTimeout must be >= 0");
+            }
+            this.queueTimeoutMillis = millis;
+            return this;
+        }
+
+        /**
+         * Add a task timeout listener. Multiple listeners can be registered and will be called
+         * in registration order. Requires {@link #runTimeout(long)} and/or
+         * {@link #queueTimeout(long)} to be set to have any effect.
+         *
+         * @param listener the listener
+         * @return this builder
+         */
+        public Builder addTaskTimeoutListener(TaskTimeoutListener listener) {
+            this.taskTimeoutListeners.add(listener);
+            return this;
+        }
+
+        /**
+         * Set the threshold (milliseconds) above which a single refresh cycle is logged as a
+         * warning. This surfaces a slow/blocking {@code Supplier} that would otherwise silently
+         * stall the shared refresher thread (and any {@link DynamicThreadPoolExecutor#refreshNow()}
+         * caller). Default is {@code 1000}ms. A value of {@code 0} disables the warning.
+         *
+         * @param millis slow-refresh warning threshold in milliseconds (must be &gt;= 0)
+         * @return this builder
+         */
+        public Builder slowRefreshThreshold(long millis) {
+            if (millis < 0) {
+                throw new IllegalArgumentException("slowRefreshThreshold must be >= 0");
+            }
+            this.slowRefreshThresholdMillis = millis;
+            return this;
+        }
+
+        /**
          * Build a {@link DynamicThreadPoolExecutor} with configured parameters.
          *
          * @return a new dynamic thread pool executor instance
@@ -329,15 +446,22 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                 threadFactory = defaultThreadFactory(prefix);
             }
 
+            if (logChanges) {
+                changeListeners.add(new LoggingChangeListener(logger));
+            }
+
             List<ParameterChangeListener> listeners = new CopyOnWriteArrayList<>(
                     changeListeners);
+            List<TaskTimeoutListener> timeoutListeners = new CopyOnWriteArrayList<>(
+                    taskTimeoutListeners);
 
-            return new DynamicThreadPoolExecutor(this, prefix, logger, listeners);
+            return new DynamicThreadPoolExecutor(this, prefix, logger, listeners, timeoutListeners);
         }
     }
 
     private DynamicThreadPoolExecutor(Builder b, String prefix, Logger logger,
-                                      List<ParameterChangeListener> listeners) {
+                                      List<ParameterChangeListener> listeners,
+                                      List<TaskTimeoutListener> timeoutListeners) {
         super(
                 b.coreSupplier.get(),
                 Math.max(b.coreSupplier.get(), b.maxSupplier.get()),
@@ -355,6 +479,10 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.queueCapacitySupplier = b.queueCapacitySupplier;
         this.log = logger;
         this.changeListeners = listeners;
+        this.taskTimeoutListeners = timeoutListeners;
+        this.runTimeoutMillis = b.runTimeoutMillis;
+        this.queueTimeoutMillis = b.queueTimeoutMillis;
+        this.slowRefreshThresholdMillis = b.slowRefreshThresholdMillis;
 
         BlockingQueue<Runnable> q = getQueue();
         if (q instanceof ResizableCapacityLinkedBlockingQueue) {
@@ -370,6 +498,8 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         this.lastKeepAliveSec = b.keepAliveSecSupplier.get();
         this.lastQueueCapacity = (resizableQueue != null) ? b.queueCapacitySupplier.get() : -1;
 
+        DynamoRegistry.register(this);
+
         long ms = b.refreshInterval.toMillis();
         this.refreshFuture = REFRESHER.scheduleWithFixedDelay(
                 this::refresh,
@@ -383,7 +513,152 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         return new ResizableCapacityLinkedBlockingQueue<>(b.queueCapacitySupplier.get());
     }
 
+    // ==================== Task-level Monitoring ====================
+
+    private boolean queueTimeoutEnabled() {
+        return queueTimeoutMillis > 0;
+    }
+
+    private boolean runTimeoutEnabled() {
+        return runTimeoutMillis > 0;
+    }
+
+    @Override
+    public void execute(Runnable command) {
+        if (command != null) {
+            largestQueueSize.accumulate(getQueue().size());
+            if (queueTimeoutEnabled()) {
+                command = new TimedRunnable(command);
+            }
+        }
+        super.execute(command);
+    }
+
+    @Override
+    protected void beforeExecute(Thread t, Runnable r) {
+        if (queueTimeoutEnabled() && r instanceof TimedRunnable) {
+            TimedRunnable tr = (TimedRunnable) r;
+            long waited = System.currentTimeMillis() - tr.enqueueMillis;
+            if (waited > queueTimeoutMillis) {
+                log.warn("[DTP-QUEUE-TIMEOUT] pool=" + poolName
+                        + " task=" + tr.taskName()
+                        + " waited=" + waited + "ms threshold=" + queueTimeoutMillis + "ms");
+                fireTaskTimeout(TaskTimeoutType.QUEUE_TIMEOUT, tr.taskName(),
+                        waited, queueTimeoutMillis);
+            }
+        }
+        if (runTimeoutEnabled()) {
+            runStartNanos.set(System.nanoTime());
+        }
+        super.beforeExecute(t, r);
+    }
+
+    @Override
+    protected void afterExecute(Runnable r, Throwable t) {
+        super.afterExecute(r, t);
+        if (runTimeoutEnabled()) {
+            Long start = runStartNanos.get();
+            runStartNanos.remove();
+            if (start != null) {
+                long elapsedMs = (System.nanoTime() - start) / 1_000_000L;
+                maxTaskTimeMillis.accumulate(elapsedMs);
+                if (elapsedMs > runTimeoutMillis) {
+                    String taskName = (r instanceof TimedRunnable)
+                            ? ((TimedRunnable) r).taskName() : String.valueOf(r);
+                    log.warn("[DTP-RUN-TIMEOUT] pool=" + poolName
+                            + " task=" + taskName
+                            + " ran=" + elapsedMs + "ms threshold=" + runTimeoutMillis + "ms");
+                    fireTaskTimeout(TaskTimeoutType.RUN_TIMEOUT, taskName,
+                            elapsedMs, runTimeoutMillis);
+                }
+            }
+        }
+    }
+
+    private void fireTaskTimeout(TaskTimeoutType type, String taskName,
+                                 long elapsedMillis, long thresholdMillis) {
+        if (taskTimeoutListeners.isEmpty()) {
+            return;
+        }
+        TaskTimeoutEvent event = new TaskTimeoutEvent(
+                poolName, type, taskName, elapsedMillis, thresholdMillis,
+                System.currentTimeMillis());
+        for (TaskTimeoutListener listener : taskTimeoutListeners) {
+            try {
+                listener.onTimeout(event);
+            } catch (Throwable ex) {
+                log.warn("TaskTimeoutListener failed for " + type, ex);
+            }
+        }
+    }
+
+    /**
+     * Wraps a submitted task to carry its enqueue timestamp, enabling queue-wait measurement.
+     */
+    private static final class TimedRunnable implements Runnable {
+        private final Runnable delegate;
+        private final long enqueueMillis = System.currentTimeMillis();
+
+        TimedRunnable(Runnable delegate) {
+            this.delegate = delegate;
+        }
+
+        String taskName() {
+            return String.valueOf(delegate);
+        }
+
+        @Override
+        public void run() {
+            delegate.run();
+        }
+    }
+
+    /**
+     * Trigger an immediate parameter refresh instead of waiting for the next scheduled poll.
+     * <p>
+     * This turns Dynamo's default polling model into a push-pull hybrid: wire this into your
+     * config center's change callback so updates take effect near-instantly, while the periodic
+     * poll still acts as a safety net.
+     * <pre>{@code
+     * configService.addListener(dataId, group, content -> {
+     *     cache.update(content);   // update whatever your Supplier reads from
+     *     pool.refreshNow();       // apply immediately, don't wait for the poll
+     * });
+     * }</pre>
+     * The call is thread-safe. It reads the current {@code Supplier} values and applies any
+     * changes, exactly as the scheduled refresh does. If another refresh is already in progress,
+     * this call returns without blocking (the in-progress refresh already sees the latest values).
+     * <p>
+     * <b>Note:</b> this runs on the calling thread, so it inherits the same requirement as the
+     * poller: your {@code Supplier} implementations must be fast and non-blocking.
+     */
+    public void refreshNow() {
+        refresh();
+    }
+
     private void refresh() {
+        // Serialize with the scheduled poller and any refreshNow() caller. If a refresh is
+        // already running, skip: it will read the latest Supplier values anyway.
+        if (!refreshLock.tryLock()) {
+            return;
+        }
+        long startNanos = System.nanoTime();
+        try {
+            doRefresh();
+        } finally {
+            refreshLock.unlock();
+            if (slowRefreshThresholdMillis > 0) {
+                long costMillis = (System.nanoTime() - startNanos) / 1_000_000L;
+                if (costMillis > slowRefreshThresholdMillis) {
+                    log.warn("[DTP-SLOW-REFRESH] pool=" + poolName
+                            + " cost=" + costMillis + "ms threshold=" + slowRefreshThresholdMillis
+                            + "ms - check your Supplier: it must be fast and non-blocking");
+                }
+            }
+        }
+    }
+
+    private void doRefresh() {
         try {
             Integer newCoreObj = coreSupplier.get();
             Integer newMaxObj = maxSupplier.get();
@@ -496,6 +771,25 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
     }
 
     /**
+     * The largest queue size ever observed on this pool (sampled at submission time).
+     *
+     * @return historical peak queue size
+     */
+    public int getLargestQueueSize() {
+        return (int) largestQueueSize.get();
+    }
+
+    /**
+     * The longest single-task execution time observed, in milliseconds. Only tracked when
+     * run-timeout detection is enabled; otherwise returns {@code 0}.
+     *
+     * @return maximum task run time in milliseconds
+     */
+    public long getMaxTaskTimeMillis() {
+        return maxTaskTimeMillis.get();
+    }
+
+    /**
      * Get a snapshot of current thread pool metrics.
      * <p>
      * This method is lightweight and can be called frequently (e.g., every 10 seconds)
@@ -517,6 +811,9 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
                 queue.size(),
                 queue.remainingCapacity(),
                 rejectedCount.sum(),
+                getLargestPoolSize(),
+                (int) largestQueueSize.get(),
+                maxTaskTimeMillis.get(),
                 getCorePoolSize(),
                 getMaximumPoolSize(),
                 getKeepAliveTime(TimeUnit.SECONDS),
@@ -529,6 +826,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         if (refreshFuture != null) {
             refreshFuture.cancel(false);
         }
+        DynamoRegistry.unregister(this);
         super.shutdown();
     }
 
@@ -537,6 +835,7 @@ public class DynamicThreadPoolExecutor extends ThreadPoolExecutor {
         if (refreshFuture != null) {
             refreshFuture.cancel(true);
         }
+        DynamoRegistry.unregister(this);
         return super.shutdownNow();
     }
 
