@@ -36,6 +36,9 @@ bin/
 stress-test-output.txt
 stress-test-result.txt
 
+# Internal-only docs (not for public repo)
+INTERNAL_GUIDE.md
+
 # Build artifacts
 *.jar
 *.war
